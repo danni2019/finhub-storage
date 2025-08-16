@@ -20,6 +20,14 @@ except (ImportError, FileNotFoundError):
         def error(self, msg): print(f"ERROR: {msg}")
     logger = SimpleLogger()
 
+# Try to import configuration system
+try:
+    from infra.tool.config import file_storage_config
+    CONFIG_AVAILABLE = True
+except (ImportError, FileNotFoundError):
+    CONFIG_AVAILABLE = False
+    logger.warning("Configuration system not available, using default file storage settings")
+
 
 class LocalFileStorage(FileStorageBase):
     """
@@ -35,7 +43,7 @@ class LocalFileStorage(FileStorageBase):
     """
     
     SUPPORTED_FORMATS = ['csv', 'json', 'excel']
-    DEFAULT_FORMAT = 'csv'  # CSV is most compatible
+    DEFAULT_FORMAT = 'parquet'  # Parquet for best compatibility with ArcticDB
     
     def __init_class_formats__(self):
         """Initialize supported formats based on available libraries"""
@@ -54,10 +62,23 @@ class LocalFileStorage(FileStorageBase):
         
         Args:
             storage_config: Configuration dictionary containing:
-                - base_path: Base directory for storage (default: ./doc/fs)
-                - default_format: Default file format (default: csv)
-                - create_dirs: Whether to create directories automatically (default: True)
+                - base_path: Base directory for storage (default: from config system or ./doc/fs)
+                - default_format: Default file format (default: from config system or parquet)
+                - create_dirs: Whether to create directories automatically (default: from config system or True)
+                
+        Note: If storage_config is provided, it takes precedence over the config system.
+              This maintains backward compatibility while enabling config system integration.
         """
+        # Load configuration from config system if available and no explicit config provided
+        if storage_config is None and CONFIG_AVAILABLE:
+            try:
+                storage_config = file_storage_config()
+                logger.info("File storage configuration loaded from config system")
+            except Exception as e:
+                logger.warning(f"Failed to load config from system: {e}, using defaults")
+                storage_config = {}
+        
+        # Use provided config or default fallback
         self.config = storage_config or {}
         self.base_path = Path(self.config.get('base_path', './doc/fs'))
         self.default_format = self.config.get('default_format', self.DEFAULT_FORMAT)
@@ -70,7 +91,7 @@ class LocalFileStorage(FileStorageBase):
         if self.create_dirs:
             self.base_path.mkdir(parents=True, exist_ok=True)
             
-        logger.info(f"LocalFileStorage initialized with base_path: {self.base_path}")
+        logger.info(f"LocalFileStorage initialized with base_path: {self.base_path}, default_format: {self.default_format}")
     
     def _get_file_path(self, schema: str, tb_name: str, format_ext: str = None) -> Path:
         """
