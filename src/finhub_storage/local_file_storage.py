@@ -46,15 +46,20 @@ class LocalFileStorage(FileStorageBase):
     DEFAULT_FORMAT = 'parquet'  # Parquet for best compatibility with ArcticDB
     
     def __init_class_formats__(self):
-        """Initialize supported formats based on available libraries"""
-        try:
-            import pyarrow
+        """Initialize supported formats based on available libraries
+
+        Parquet support is only enabled when pyarrow is available. No silent
+        fallback is performed; if the user/config requests parquet but the
+        dependency is missing, an exception will be raised later during
+        validation.
+        """
+        try:  # noqa: F401
+            import pyarrow  # type: ignore
             if 'parquet' not in self.SUPPORTED_FORMATS:
                 self.SUPPORTED_FORMATS.append('parquet')
         except ImportError:
-            logger.info("pyarrow not available, parquet format disabled")
-            if self.default_format == 'parquet':
-                self.default_format = 'csv'
+            # Do not modify defaults here; validation later will raise if needed
+            logger.info("pyarrow not available; parquet format will be unsupported")
     
     def __init__(self, storage_config: dict = None):
         """
@@ -86,12 +91,45 @@ class LocalFileStorage(FileStorageBase):
         
         # Initialize supported formats based on available libraries
         self.__init_class_formats__()
+
+        # Validate selected default format (must be supported & dependencies present)
+        self._validate_format(self.default_format, raise_missing_dependency=True)
         
         # Ensure base path exists
         if self.create_dirs:
             self.base_path.mkdir(parents=True, exist_ok=True)
             
         logger.info(f"LocalFileStorage initialized with base_path: {self.base_path}, default_format: {self.default_format}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers for format validation / path derivation
+    # ------------------------------------------------------------------
+
+    def _validate_format(self, format_ext: str, raise_missing_dependency: bool = False) -> bool:
+        """Validate requested format.
+
+        Args:
+            format_ext: Requested file format.
+            raise_missing_dependency: If True, raise when format unsupported
+                instead of returning False.
+
+        Returns:
+            bool indicating support when raise_missing_dependency is False.
+        """
+        # Refresh supported formats in case environment changed dynamically
+        if format_ext not in self.SUPPORTED_FORMATS:
+            if raise_missing_dependency:
+                raise ValueError(f"Unsupported file format requested: {format_ext}. Supported: {self.SUPPORTED_FORMATS}")
+            return False
+
+        if format_ext == 'parquet':
+            try:  # noqa: F401
+                import pyarrow  # type: ignore
+            except ImportError:
+                if raise_missing_dependency:
+                    raise ImportError("pyarrow is required for parquet format but is not installed")
+                return False
+        return True
     
     def _parse_table_name(self, tb_name: str) -> tuple:
         """
@@ -223,13 +261,11 @@ class LocalFileStorage(FileStorageBase):
         elif format_ext == 'excel':
             df.to_excel(file_path, index=False, engine='openpyxl')
         elif format_ext == 'parquet':
+            # No fallback allowed per new requirements
             try:
                 df.to_parquet(file_path, index=False, engine='pyarrow')
-            except ImportError:
-                logger.warning(f"pyarrow not available, falling back to CSV for {file_path}")
-                # Change extension to csv and save as CSV
-                csv_path = file_path.with_suffix('.csv')
-                df.to_csv(csv_path, index=False, encoding='utf-8')
+            except ImportError as e:
+                raise ImportError("pyarrow is required to write parquet files; install pyarrow or choose another format") from e
         else:
             raise ValueError(f"Unsupported format: {format_ext}")
     
@@ -272,7 +308,8 @@ class LocalFileStorage(FileStorageBase):
             return pd.DataFrame()
     
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, 
-                        index: List[str], auto_extend_col: bool = False) -> None:
+                        index: List[str], auto_extend_col: bool = False,
+                        format_ext: str = 'parquet') -> None:
         """
         Insert/update DataFrame into file storage
         
@@ -282,6 +319,8 @@ class LocalFileStorage(FileStorageBase):
             tb_name: Table name (used as filename base)
             index: List of columns to use as primary key for deduplication
             auto_extend_col: Whether to automatically add new columns (always True for files)
+            format_ext: Target file format (default 'parquet'). Must be supported and
+                have its dependencies installed. No silent fallback occurs.
         """
         if df is None or df.empty:
             logger.warning(f"Empty DataFrame provided for {schema}.{tb_name}")
@@ -301,9 +340,16 @@ class LocalFileStorage(FileStorageBase):
         # Ensure directory exists
         self._ensure_schema_dir(schema, tb_name)
         
-        # Detect existing file format or use default
+        # Determine format to use (explicit parameter overrides autodetect)
+        format_to_use = format_ext or self.default_format
+        self._validate_format(format_to_use, raise_missing_dependency=True)
+
+        # If a file already exists in a different format than requested, raise to avoid ambiguity
         existing_format = self._detect_existing_format(schema, tb_name)
-        format_to_use = existing_format or self.default_format
+        if existing_format and existing_format != format_to_use:
+            raise ValueError(
+                f"Existing table {schema}.{tb_name} stored as {existing_format}; requested format {format_to_use} differs."
+            )
         
         file_path = self._get_file_path(schema, tb_name, format_to_use)
         
@@ -328,7 +374,8 @@ class LocalFileStorage(FileStorageBase):
                       filter_column: Optional[List[str]] = None,
                       filter_keyword: Optional[Dict[str, Dict[str, Any]]] = None,
                       ascending: Optional[List[tuple]] = None,
-                      limit: Optional[int] = None) -> pd.DataFrame:
+                      limit: Optional[int] = None,
+                      format_ext: str = 'parquet') -> pd.DataFrame:
         """
         Read DataFrame from file storage
         
@@ -339,16 +386,25 @@ class LocalFileStorage(FileStorageBase):
             filter_keyword: Dictionary of filters (e.g., {'col': {'eq': 'value', 'gt': 10}})
             ascending: List of (column, ascending) tuples for sorting
             limit: Maximum number of rows to return
+            format_ext: Expected file format (default 'parquet'). If a different
+                on-disk format exists, an error is raised to prevent accidental
+                cross-format reads.
             
         Returns:
             DataFrame with requested data
         """
-        # Detect existing file format
+        requested_format = format_ext or self.default_format
+        self._validate_format(requested_format, raise_missing_dependency=True)
+
         existing_format = self._detect_existing_format(schema, tb_name)
         if not existing_format:
             logger.warning(f"No file found for {schema}.{tb_name}")
             return pd.DataFrame()
-        
+        if existing_format != requested_format:
+            raise ValueError(
+                f"Existing table {schema}.{tb_name} format {existing_format} does not match requested {requested_format}"
+            )
+
         file_path = self._get_file_path(schema, tb_name, existing_format)
         df = self._load_dataframe(file_path, existing_format)
         
@@ -423,7 +479,7 @@ class LocalFileStorage(FileStorageBase):
         
         return filtered_df
     
-    def exists(self, schema: str, tb_name: str, filter_dict: Dict[str, Any]) -> bool:
+    def exists(self, schema: str, tb_name: str, filter_dict: Dict[str, Any], format_ext: str = 'parquet') -> bool:
         """
         Check if records matching the filter exist
         
@@ -431,6 +487,7 @@ class LocalFileStorage(FileStorageBase):
             schema: Schema name
             tb_name: Table name
             filter_dict: Dictionary of key-value pairs to filter by
+            format_ext: Expected file format (default 'parquet')
             
         Returns:
             True if matching records exist
@@ -443,10 +500,10 @@ class LocalFileStorage(FileStorageBase):
         for key, value in filter_dict.items():
             filter_keyword[key] = {'eq': value}
         
-        df = self.read_dataframe(schema, tb_name, filter_keyword=filter_keyword, limit=1)
+        df = self.read_dataframe(schema, tb_name, filter_keyword=filter_keyword, limit=1, format_ext=format_ext)
         return not df.empty
     
-    def delete_records(self, schema: str, tb_name: str, filter_dict: Dict[str, Any]) -> None:
+    def delete_records(self, schema: str, tb_name: str, filter_dict: Dict[str, Any], format_ext: str = 'parquet') -> None:
         """
         Delete records matching the filter
         
@@ -455,11 +512,16 @@ class LocalFileStorage(FileStorageBase):
             tb_name: Table name
             filter_dict: Dictionary of key-value pairs to filter by
         """
+        requested_format = format_ext or self.default_format
         existing_format = self._detect_existing_format(schema, tb_name)
         if not existing_format:
             logger.warning(f"No file found for {schema}.{tb_name}")
             return
-        
+        if existing_format != requested_format:
+            raise ValueError(
+                f"Existing table {schema}.{tb_name} format {existing_format} does not match requested {requested_format}"
+            )
+
         file_path = self._get_file_path(schema, tb_name, existing_format)
         df = self._load_dataframe(file_path, existing_format)
         
@@ -481,7 +543,7 @@ class LocalFileStorage(FileStorageBase):
         deleted_count = len(df) - len(df_filtered)
         logger.info(f"Deleted {deleted_count} records from {schema}.{tb_name}")
     
-    def drop_table(self, schema: str, tb_name: str) -> None:
+    def drop_table(self, schema: str, tb_name: str, format_ext: str = 'parquet') -> None:
         """
         Drop/delete a table (file)
         
@@ -489,17 +551,22 @@ class LocalFileStorage(FileStorageBase):
             schema: Schema name
             tb_name: Table name
         """
-        # Try to find and delete file in any supported format
-        deleted = False
-        for fmt in self.SUPPORTED_FORMATS:
-            file_path = self._get_file_path(schema, tb_name, fmt)
-            if file_path.exists():
-                file_path.unlink()
-                logger.info(f"Dropped table {schema}.{tb_name} (format: {fmt})")
-                deleted = True
-        
-        if not deleted:
+        # Only consider the explicitly requested (or default) format to avoid accidental cross-format deletion
+        requested_format = format_ext or self.default_format
+        existing_format = self._detect_existing_format(schema, tb_name)
+        if not existing_format:
             logger.warning(f"No file found to drop for {schema}.{tb_name}")
+            return
+        if existing_format != requested_format:
+            raise ValueError(
+                f"Attempted to drop {schema}.{tb_name} as {requested_format} but on-disk format is {existing_format}"
+            )
+        file_path = self._get_file_path(schema, tb_name, existing_format)
+        if file_path.exists():
+            file_path.unlink()
+            logger.info(f"Dropped table {schema}.{tb_name} (format: {existing_format})")
+        else:
+            logger.warning(f"File path not found for drop: {file_path}")
     
     def get_table_names(self, schema: str) -> List[str]:
         """
@@ -542,7 +609,7 @@ class LocalFileStorage(FileStorageBase):
         
         return sorted(list(table_names))
     
-    def get_column_names(self, schema: str, tb_name: str) -> List[str]:
+    def get_column_names(self, schema: str, tb_name: str, format_ext: str = 'parquet') -> List[str]:
         """
         Get list of column names in a table
         
@@ -553,10 +620,14 @@ class LocalFileStorage(FileStorageBase):
         Returns:
             List of column names
         """
+        requested_format = format_ext or self.default_format
         existing_format = self._detect_existing_format(schema, tb_name)
         if not existing_format:
             return []
-        
+        if existing_format != requested_format:
+            raise ValueError(
+                f"Existing table {schema}.{tb_name} format {existing_format} does not match requested {requested_format}"
+            )
         file_path = self._get_file_path(schema, tb_name, existing_format)
         df = self._load_dataframe(file_path, existing_format)
         
