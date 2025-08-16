@@ -93,12 +93,47 @@ class LocalFileStorage(FileStorageBase):
             
         logger.info(f"LocalFileStorage initialized with base_path: {self.base_path}, default_format: {self.default_format}")
     
-    def _get_file_path(self, schema: str, tb_name: str, format_ext: str = None) -> Path:
+    def _parse_table_name(self, tb_name: str) -> tuple:
         """
-        Get the full file path for a table
+        Parse table name to extract status and country according to naming convention
+        
+        According to data/readme.md, all table names follow the pattern:
+        {status}_{country}_{other_fields}
+        where status is first field (raw/processed) and country is second field (cn/us/eu)
         
         Args:
-            schema: Schema name (directory)
+            tb_name: Table name following the naming convention
+            
+        Returns:
+            Tuple of (status, country, remaining_name)
+            If parsing fails, returns (None, None, tb_name)
+        """
+        parts = tb_name.split('_')
+        if len(parts) >= 3:
+            status = parts[0]
+            country = parts[1]
+            
+            # Validate status and country according to naming convention
+            valid_status = ['raw', 'processed']
+            valid_country = ['cn', 'us', 'eu']
+            
+            if status in valid_status and country in valid_country:
+                remaining_name = '_'.join(parts[2:])
+                return status, country, remaining_name
+        
+        # Fallback for non-conforming table names
+        logger.warning(f"Table name '{tb_name}' does not follow naming convention, using fallback")
+        return None, None, tb_name
+
+    def _get_file_path(self, schema: str, tb_name: str, format_ext: str = None) -> Path:
+        """
+        Get the full file path for a table with hierarchical directory structure
+        
+        Creates hierarchical path: base_path/status/country/remaining_name.format
+        Falls back to base_path/schema/tb_name.format for non-conforming names
+        
+        Args:
+            schema: Schema name (used as fallback directory for non-conforming names)
             tb_name: Table name (filename base)
             format_ext: File format extension (default: self.default_format)
             
@@ -108,21 +143,44 @@ class LocalFileStorage(FileStorageBase):
         if format_ext is None:
             format_ext = self.default_format
         
-        schema_path = self.base_path / schema
-        file_path = schema_path / f"{tb_name}.{format_ext}"
+        status, country, remaining_name = self._parse_table_name(tb_name)
+        
+        if status and country:
+            # Use hierarchical structure: base_path/status/country/remaining_name.format
+            dir_path = self.base_path / status / country
+            file_path = dir_path / f"{remaining_name}.{format_ext}"
+        else:
+            # Fallback to original structure for non-conforming names
+            schema_path = self.base_path / schema
+            file_path = schema_path / f"{tb_name}.{format_ext}"
         
         return file_path
     
-    def _ensure_schema_dir(self, schema: str) -> None:
+    def _ensure_schema_dir(self, schema: str, tb_name: str = None) -> None:
         """
-        Ensure schema directory exists
+        Ensure directory exists for the given schema and table name
+        
+        If tb_name follows naming convention, creates status/country directories
+        Otherwise creates traditional schema directory
         
         Args:
-            schema: Schema name
+            schema: Schema name (used as fallback for non-conforming names)
+            tb_name: Table name (optional, used to determine directory structure)
         """
-        schema_path = self.base_path / schema
+        if tb_name:
+            status, country, _ = self._parse_table_name(tb_name)
+            if status and country:
+                # Create hierarchical directories: base_path/status/country/
+                dir_path = self.base_path / status / country
+            else:
+                # Fallback to schema directory for non-conforming names
+                dir_path = self.base_path / schema
+        else:
+            # Traditional schema directory when no table name provided
+            dir_path = self.base_path / schema
+        
         if self.create_dirs:
-            schema_path.mkdir(parents=True, exist_ok=True)
+            dir_path.mkdir(parents=True, exist_ok=True)
     
     def _detect_existing_format(self, schema: str, tb_name: str) -> Optional[str]:
         """
@@ -240,8 +298,8 @@ class LocalFileStorage(FileStorageBase):
                 logger.warning(f"{schema}.{tb_name} contains duplicates based on index {index}. "
                              f"Duplicates removed: {len(duplicates)} rows")
         
-        # Ensure schema directory exists
-        self._ensure_schema_dir(schema)
+        # Ensure directory exists
+        self._ensure_schema_dir(schema, tb_name)
         
         # Detect existing file format or use default
         existing_format = self._detect_existing_format(schema, tb_name)
@@ -447,23 +505,39 @@ class LocalFileStorage(FileStorageBase):
         """
         Get list of table names in a schema
         
+        Searches both hierarchical (status/country) and traditional (schema) directory structures
+        
         Args:
             schema: Schema name
             
         Returns:
-            List of table names (without file extensions)
+            List of table names (reconstructed from hierarchical structure when applicable)
         """
-        schema_path = self.base_path / schema
-        if not schema_path.exists() or not schema_path.is_dir():
-            return []
-        
         table_names = set()
-        for file_path in schema_path.iterdir():
-            if file_path.is_file():
-                # Remove file extension to get table name
-                name_parts = file_path.name.rsplit('.', 1)
-                if len(name_parts) == 2 and name_parts[1] in self.SUPPORTED_FORMATS:
-                    table_names.add(name_parts[0])
+        
+        # Search hierarchical structure: base_path/status/country/
+        for status_path in self.base_path.iterdir():
+            if status_path.is_dir() and status_path.name in ['raw', 'processed']:
+                for country_path in status_path.iterdir():
+                    if country_path.is_dir() and country_path.name in ['cn', 'us', 'eu']:
+                        for file_path in country_path.iterdir():
+                            if file_path.is_file():
+                                # Remove file extension to get remaining name
+                                name_parts = file_path.name.rsplit('.', 1)
+                                if len(name_parts) == 2 and name_parts[1] in self.SUPPORTED_FORMATS:
+                                    # Reconstruct full table name: status_country_remaining_name
+                                    full_name = f"{status_path.name}_{country_path.name}_{name_parts[0]}"
+                                    table_names.add(full_name)
+        
+        # Also search traditional schema structure for backward compatibility
+        schema_path = self.base_path / schema
+        if schema_path.exists() and schema_path.is_dir():
+            for file_path in schema_path.iterdir():
+                if file_path.is_file():
+                    # Remove file extension to get table name
+                    name_parts = file_path.name.rsplit('.', 1)
+                    if len(name_parts) == 2 and name_parts[1] in self.SUPPORTED_FORMATS:
+                        table_names.add(name_parts[0])
         
         return sorted(list(table_names))
     
