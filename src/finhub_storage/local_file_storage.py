@@ -85,7 +85,20 @@ class LocalFileStorage(FileStorageBase):
         
         # Use provided config or default fallback
         self.config = storage_config or {}
-        self.base_path = Path(self.config.get('base_path', './doc/fs'))
+        base_path_config = self.config.get('base_path', './doc/fs')
+        
+        # 确保使用绝对路径
+        if Path(base_path_config).is_absolute():
+            self.base_path = Path(base_path_config)
+        else:
+            # 对于相对路径，基于项目根目录进行解析
+            try:
+                from infra.tool.config import project_path
+                self.base_path = (Path(project_path()) / base_path_config).resolve()
+            except (ImportError, Exception):
+                # 如果无法获取项目路径，使用当前工作目录
+                self.base_path = Path(base_path_config).resolve()
+        
         self.default_format = self.config.get('default_format', self.DEFAULT_FORMAT)
         self.create_dirs = self.config.get('create_dirs', True)
         
