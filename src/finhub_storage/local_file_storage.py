@@ -645,3 +645,82 @@ class LocalFileStorage(FileStorageBase):
         df = self._load_dataframe(file_path, existing_format)
         
         return df.columns.tolist()
+    
+    def insert_json(self, data: Any, schema: str, tb_name: str) -> None:
+        """
+        Insert/update JSON data into file storage
+        
+        Args:
+            data: JSON-like data to insert (dict, list, or JSON-serializable object)
+            schema: Schema name (used as directory/namespace)
+            tb_name: Table name (used as filename base)
+            
+        Note:
+            This method performs full-volume writes and does not support 
+            incremental updates or deduplication like insert_dataframe.
+        """
+        if data is None:
+            logger.warning(f"None data provided for {schema}.{tb_name}")
+            return
+        
+        # Ensure directory exists
+        self._ensure_schema_dir(schema, tb_name)
+        
+        # Always use JSON format for JSON methods
+        format_to_use = 'json'
+        self._validate_format(format_to_use, raise_missing_dependency=True)
+        
+        file_path = self._get_file_path(schema, tb_name, format_to_use)
+        
+        # Ensure parent directory exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save JSON data directly
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.info(f"JSON data inserted into {schema}.{tb_name}: {file_path}")
+        except (TypeError, ValueError) as e:
+            logger.error(f"Failed to serialize data to JSON for {schema}.{tb_name}: {e}")
+            raise ValueError(f"Data is not JSON-serializable: {e}") from e
+        except Exception as e:
+            logger.error(f"Failed to write JSON file {file_path}: {e}")
+            raise
+    
+    def read_json(self, schema: str, tb_name: str) -> Any:
+        """
+        Read JSON data from file storage
+        
+        Args:
+            schema: Schema name
+            tb_name: Table name
+            
+        Returns:
+            JSON data (dict, list, or other JSON-serializable object)
+            
+        Note:
+            This method performs full-volume reads and does not support 
+            filtering or column selection like read_dataframe.
+        """
+        # Always use JSON format for JSON methods
+        format_to_use = 'json'
+        self._validate_format(format_to_use, raise_missing_dependency=True)
+        
+        file_path = self._get_file_path(schema, tb_name, format_to_use)
+        
+        if not file_path.exists():
+            logger.warning(f"No JSON file found for {schema}.{tb_name}")
+            return None
+        
+        # Load JSON data directly
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logger.info(f"JSON data read from {schema}.{tb_name}: {file_path}")
+            return data
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON file {file_path}: {e}")
+            raise ValueError(f"Invalid JSON format in file {file_path}: {e}") from e
+        except Exception as e:
+            logger.error(f"Failed to read JSON file {file_path}: {e}")
+            raise
