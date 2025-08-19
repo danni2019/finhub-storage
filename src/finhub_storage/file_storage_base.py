@@ -128,6 +128,40 @@ class FileStorageBase(ABC):
         """
         pass
     
+    @abstractmethod
+    def insert_json(self, data: Any, schema: str, tb_name: str) -> None:
+        """
+        Insert/update JSON data into file storage
+        
+        Args:
+            data: JSON-like data to insert (dict, list, or JSON-serializable object)
+            schema: Schema name (used as directory/namespace)
+            tb_name: Table name (used as filename base)
+            
+        Note:
+            This method performs full-volume writes and does not support 
+            incremental updates or deduplication like insert_dataframe.
+        """
+        pass
+    
+    @abstractmethod
+    def read_json(self, schema: str, tb_name: str) -> Any:
+        """
+        Read JSON data from file storage
+        
+        Args:
+            schema: Schema name
+            tb_name: Table name
+            
+        Returns:
+            JSON data (dict, list, or other JSON-serializable object)
+            
+        Note:
+            This method performs full-volume reads and does not support 
+            filtering or column selection like read_dataframe.
+        """
+        pass
+    
     @staticmethod
     def _normalize_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
         """
