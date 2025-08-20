@@ -11,7 +11,7 @@ from .file_storage_base import FileStorageBase
 # Try to use the project's logging system, fall back to simple logger
 try:
     from infra.tool.log import log
-    logger = log(__file__, 'data')
+    logger = log(__file__, 'infra')
 except (ImportError, FileNotFoundError):
     # Simple logger fallback for when config system is not available
     class SimpleLogger:
