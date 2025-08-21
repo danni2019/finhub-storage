@@ -750,3 +750,154 @@ class LocalFileStorage(FileStorageBase):
         except Exception as e:
             logger.error(f"Failed to read JSON file {file_path}: {e}")
             raise
+    
+    def _detect_file_type(self, tb_name: str) -> str:
+        """
+        Detect file type based on filename extension
+        
+        Args:
+            tb_name: Table name (should include extension)
+            
+        Returns:
+            'text' for text files, 'binary' for binary files
+            
+        Raises:
+            TypeError: If file type is not supported
+        """
+        # Extract file extension
+        file_path = Path(tb_name)
+        extension = file_path.suffix.lower()
+        
+        # Define supported file types
+        text_extensions = {'.md', '.txt'}
+        binary_extensions = {'.pdf', '.png', '.jpg', '.jpeg'}
+        
+        if extension in text_extensions:
+            return 'text'
+        elif extension in binary_extensions:
+            return 'binary'
+        else:
+            raise TypeError(f"Unsupported file format: {extension}. Supported formats: {text_extensions | binary_extensions}")
+    
+    def _get_file_path_with_extension(self, schema: str, tb_name: str) -> Path:
+        """
+        Get file path preserving the original extension from tb_name
+        
+        Args:
+            schema: Schema name
+            tb_name: Table name (should include extension)
+            
+        Returns:
+            Path object for the file
+        """
+        # Extract filename base and extension
+        file_path_obj = Path(tb_name)
+        name_base = file_path_obj.stem
+        extension = file_path_obj.suffix
+        
+        status, country, remaining_name = self._parse_table_name(name_base)
+        
+        if status and country:
+            # Use hierarchical structure: base_path/schema/status/country/remaining_name.extension
+            dir_path = self.base_path / schema / status / country
+            file_path = dir_path / f"{remaining_name}{extension}"
+        else:
+            # Fallback to original structure for non-conforming names
+            schema_path = self.base_path / schema
+            file_path = schema_path / tb_name
+        
+        return file_path
+    
+    def insert_any(self, data: Any, schema: str, tb_name: str) -> None:
+        """
+        Insert/update any type of data into file storage
+        
+        Supports text files (md, txt) and binary files (images: png/jpg/jpeg, PDF)
+        
+        Args:
+            data: Data to insert (str for text files, bytes for binary files)
+            schema: Schema name (used as directory/namespace)
+            tb_name: Table name (used as filename base, should include extension)
+            
+        Note:
+            File format is auto-detected from the tb_name extension.
+            Text files are saved with UTF-8 encoding.
+            Binary files are saved as-is.
+        """
+        if data is None:
+            logger.warning(f"None data provided for {schema}.{tb_name}")
+            return
+        
+        # Detect file type
+        file_type = self._detect_file_type(tb_name)
+        
+        # Ensure directory exists
+        self._ensure_schema_dir(schema, tb_name)
+        
+        # Get file path
+        file_path = self._get_file_path_with_extension(schema, tb_name)
+        
+        # Ensure parent directory exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save data based on file type
+        try:
+            if file_type == 'text':
+                if not isinstance(data, str):
+                    raise TypeError(f"Text files require str data, got {type(data)}")
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(data)
+                logger.info(f"Text data inserted into {schema}.{tb_name}: {file_path}")
+            elif file_type == 'binary':
+                if not isinstance(data, bytes):
+                    raise TypeError(f"Binary files require bytes data, got {type(data)}")
+                with open(file_path, 'wb') as f:
+                    f.write(data)
+                logger.info(f"Binary data inserted into {schema}.{tb_name}: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to write file {file_path}: {e}")
+            raise
+    
+    def read_any(self, schema: str, tb_name: str) -> Any:
+        """
+        Read any type of data from file storage
+        
+        Supports text files (md, txt) and binary files (images: png/jpg/jpeg, PDF)
+        
+        Args:
+            schema: Schema name
+            tb_name: Table name (should include extension)
+            
+        Returns:
+            str for text files, bytes for binary files
+            
+        Note:
+            File format is auto-detected from the tb_name extension.
+            Text files are read with UTF-8 encoding.
+            Binary files are read as bytes.
+        """
+        # Detect file type
+        file_type = self._detect_file_type(tb_name)
+        
+        # Get file path
+        file_path = self._get_file_path_with_extension(schema, tb_name)
+        
+        if not file_path.exists():
+            logger.warning(f"No file found for {schema}.{tb_name}")
+            return None
+        
+        # Load data based on file type
+        try:
+            if file_type == 'text':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = f.read()
+                logger.info(f"Text data read from {schema}.{tb_name}: {file_path}")
+                return data
+            elif file_type == 'binary':
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                logger.info(f"Binary data read from {schema}.{tb_name}: {file_path}")
+                return data
+        except Exception as e:
+            logger.error(f"Failed to read file {file_path}: {e}")
+            raise

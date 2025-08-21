@@ -162,6 +162,46 @@ class FileStorageBase(ABC):
         """
         pass
     
+    @abstractmethod
+    def insert_any(self, data: Any, schema: str, tb_name: str) -> None:
+        """
+        Insert/update any type of data into file storage
+        
+        Supports text files (md, txt) and binary files (images: png/jpg/jpeg, PDF)
+        
+        Args:
+            data: Data to insert (str for text files, bytes for binary files)
+            schema: Schema name (used as directory/namespace)
+            tb_name: Table name (used as filename base, should include extension)
+            
+        Note:
+            File format is auto-detected from the tb_name extension.
+            Text files are saved with UTF-8 encoding.
+            Binary files are saved as-is.
+        """
+        pass
+    
+    @abstractmethod
+    def read_any(self, schema: str, tb_name: str) -> Any:
+        """
+        Read any type of data from file storage
+        
+        Supports text files (md, txt) and binary files (images: png/jpg/jpeg, PDF)
+        
+        Args:
+            schema: Schema name
+            tb_name: Table name (should include extension)
+            
+        Returns:
+            str for text files, bytes for binary files
+            
+        Note:
+            File format is auto-detected from the tb_name extension.
+            Text files are read with UTF-8 encoding.
+            Binary files are read as bytes.
+        """
+        pass
+    
     @staticmethod
     def _normalize_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
         """
