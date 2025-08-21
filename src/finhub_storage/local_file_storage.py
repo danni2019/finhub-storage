@@ -4,9 +4,35 @@ import pandas as pd
 from pathlib import Path
 from typing import Union, Optional, List, Dict, Any
 from datetime import datetime
-import warnings
-
 from .file_storage_base import FileStorageBase
+
+"""
+MUST READ!
+HOW THE SCHEMA.TB_NAME PARAM TRANSFORMS INTO FS PATHS:
+
+TB_NAME ALL FALLS UNDER THE SAME NAMING RULE LIKE:
+
+{STATUS}_{COUNTRY}_{XXX}_{XXX}_{XXX}
+
+AND SINCE THE FIRST TWO PARTS OF TB_NAME NAMING RULES ARE ALWAYS 'STATUS' AND 'COUNTRY', 
+THEY ARE BEEN USED AS PART OF THE FS PATHS.
+
+AND THE RIGHT FS PATH CONSTRUCT AS FOLLOW:
+
+{SCHEMA}/{STATUS}/{COUNTRY}/{REMAINING_TB_NAME}
+
+FOR EXAMPLE:
+
+In LocalFileStorage, if a dataframe saved as asset.raw_cn_future_md_daily_AKShare.parquet
+then in fs directory, it is saved in : doc/fs/asset/raw/cn/future_md_daily_AKShare.parquet
+
+When reading this dataframe, passing in asset and raw_cn_future_md_daily_AKShare.parquet as schema and tb_name
+the LocalFileStorage instance will first parse schema and tb_name param into the right fs path:
+doc/fs/asset/raw/cn/future_md_daily_AKShare.parquet
+then try to read the dataframe from this path.
+
+"""
+
 
 # Try to use the project's logging system, fall back to simple logger
 try:
