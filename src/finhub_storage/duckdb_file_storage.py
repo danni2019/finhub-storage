@@ -44,6 +44,14 @@ class DuckDBFileStorage(LocalFileStorage):
 
         self.default_format = self.storage_config.get('default_format', 'parquet')
 
+    @staticmethod
+    def _escape_string_literal(path: str) -> str:
+        """
+        Mimic duckdb.escape_string_literal for file paths.
+        Wrap the string in single quotes and escape inner quotes.
+        """
+        return "'" + path.replace("'", "''") + "'"
+
     @contextmanager
     def _duckdb_connection(self):
         """Context manager for DuckDB connection."""
@@ -103,75 +111,87 @@ class DuckDBFileStorage(LocalFileStorage):
 
     # ---------------------------- Write (UPSERT w/ DuckDB) ---------------------------- #
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str,
-                         index: List[str],
-                         format_ext: str = 'parquet') -> None:
-        """Upsert-like insert using DuckDB to avoid loading large Parquet into Pandas.
-
-        Semantics:
-          - If file doesn't exist: create it from df (first write path).
-          - If file exists & index provided: remove existing rows with matching index
-            from old Parquet, then UNION BY NAME with new rows (dedup on index).
-          - If file exists & no index provided: append-all semantics via UNION BY NAME.
-
-        Notes:
-          - Parquet is immutable; we rewrite the file by streaming through DuckDB.
-          - DataFrame Pandas index is *not* stored (same as your original code).
+                        index: List[str],
+                        format_ext: str = 'parquet') -> None:
+        """
+        Efficient upsert/append to Parquet using DuckDB.
+        - First write: direct COPY.
+        - Subsequent writes:
+            - If index: new data replaces old data with same index (anti-join + union).
+            - If no index: simply append (union).
         """
         if df is None or df.empty:
             logger.warning(f"Empty DataFrame provided for {schema}.{tb_name}")
             return
 
-        # Prepare & validate
         df_prepared = self._prepare_dataframe_for_storage(df.copy())
         format_to_use = format_ext or self.default_format
         self._validate_format(format_to_use, raise_missing_dependency=True)
 
-        # Ensure directory exists and resolve file path
+        # Ensure directory and file path
         self._ensure_schema_dir(schema, tb_name)
         file_path = self._get_file_path(schema, tb_name, format_to_use)
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Register incoming frame as a DuckDB temp view
         with self._duckdb_connection() as conn:
-            conn.unregister("new_data") if "new_data" in conn.get_table_names() else None
+            # Register new data
+            try:
+                conn.unregister("new_data")
+            except Exception:
+                pass
             conn.register("new_data", df_prepared)
 
-            # First write: create file directly via DuckDB COPY
+            # First write: file does not exist
             if not file_path.exists():
-                sql_first = "COPY (SELECT * FROM new_data) TO ? (FORMAT 'parquet')"
-                conn.execute(sql_first, [str(file_path.as_posix())])
+                file_str = str(file_path.as_posix()).replace("'", "''")
+                sql_first = f"COPY (SELECT * FROM new_data) TO '{file_str}' (FORMAT PARQUET)"
+                conn.execute(sql_first)
                 logger.info(f"Data inserted (first write) into {schema}.{tb_name}: DataFrame{df_prepared.shape}, format: {format_to_use}")
                 return
 
-            # File exists: build merged SELECT using DuckDB over Parquet
-            path_str = file_path.as_posix()
+            # File exists: merge
+            path_escaped = str(file_path.as_posix()).replace("'", "''")
+            # 获取所有列（旧+新，顺序不变）
+            cols_df = conn.execute(f"SELECT * FROM read_parquet('{file_path.as_posix()}') LIMIT 1").fetchdf()
+            old_cols = cols_df.columns.tolist()
+            new_cols = df_prepared.columns.tolist()
+            all_cols = list(dict.fromkeys(old_cols + new_cols))
+
+            def build_select(table_alias, available_cols):
+                return ", ".join(
+                    f"{table_alias}.{self._q_ident(c)}" if c in available_cols else f"NULL AS {self._q_ident(c)}"
+                    for c in all_cols
+                )
 
             if index and len(index) > 0:
-                # Anti-join on index columns to drop conflicting old rows
+                # 去重：新数据覆盖旧数据（按index去重）
                 idx_conds = " AND ".join([f"t.{self._q_ident(c)} = n.{self._q_ident(c)}" for c in index])
                 merged_select = f"""
                     WITH old_filtered AS (
-                        SELECT *
-                        FROM read_parquet('{path_str}') AS t
+                        SELECT {build_select('t', old_cols)}
+                        FROM read_parquet('{path_escaped}') AS t
                         WHERE NOT EXISTS (
                             SELECT 1 FROM new_data AS n WHERE {idx_conds}
                         )
                     )
                     SELECT * FROM old_filtered
-                    UNION BY NAME ALL
-                    SELECT * FROM new_data
+                    UNION BY NAME
+                    SELECT {build_select('n', new_cols)} FROM new_data AS n
                 """
             else:
-                # No index: pure append (no dedup)
+                # 直接追加
                 merged_select = f"""
-                    SELECT * FROM read_parquet('{path_str}')
-                    UNION BY NAME ALL
-                    SELECT * FROM new_data
+                    SELECT {build_select('t', old_cols)}
+                    FROM read_parquet('{path_escaped}') AS t
+                    UNION BY NAME
+                    SELECT {build_select('n', new_cols)} FROM new_data AS n
                 """
 
-            # Write to a temp parquet then atomically replace
+            # 写入临时文件，再原子替换
             tmp_path = file_path.with_suffix('.tmp.parquet')
-            conn.execute(f"COPY ({merged_select}) TO ? (FORMAT 'parquet')", [str(tmp_path.as_posix())])
+            tmp_str = str(tmp_path.as_posix()).replace("'", "''")
+            sql_merge = f"COPY ({merged_select}) TO '{tmp_str}' (FORMAT PARQUET)"
+            conn.execute(sql_merge)
             try:
                 tmp_path.replace(file_path)
             finally:
@@ -182,6 +202,7 @@ class DuckDBFileStorage(LocalFileStorage):
                         pass
 
         logger.info(f"Data inserted (merged) into {schema}.{tb_name}: DataFrame{df_prepared.shape}, format: {format_to_use}")
+
 
     # ---------------------------- Read (via DuckDB) ---------------------------- #
     def read_dataframe(self, schema: str, tb_name: str,
