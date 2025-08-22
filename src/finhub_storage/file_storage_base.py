@@ -27,7 +27,7 @@ class FileStorageBase(ABC):
     
     @abstractmethod
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, 
-                        index: List[str], auto_extend_col: bool = False) -> None:
+                        index: List[str]) -> None:
         """
         Insert/update DataFrame into file storage
         
@@ -36,7 +36,6 @@ class FileStorageBase(ABC):
             schema: Schema name (used as directory/namespace)
             tb_name: Table name (used as filename base)
             index: List of columns to use as primary key for deduplication
-            auto_extend_col: Whether to automatically add new columns
         """
         pass
     

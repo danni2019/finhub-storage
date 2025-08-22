@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Union, Optional, List, Dict, Any
 from datetime import datetime
-from .file_storage_base import FileStorageBase
+from infra.data.file_storage_base import FileStorageBase
 
 """
 MUST READ!
@@ -189,14 +189,8 @@ class LocalFileStorage(FileStorageBase):
         if len(parts) >= 3:
             status = parts[0]
             country = parts[1]
-            
-            # Validate status and country according to naming convention
-            valid_status = ['raw', 'processed']
-            valid_country = ['cn', 'us', 'eu']
-            
-            if status in valid_status and country in valid_country:
-                remaining_name = '_'.join(parts[2:])
-                return status, country, remaining_name
+            remaining_name = '_'.join(parts[2:])
+            return status, country, remaining_name
         
         # Fallback for non-conforming table names
         logger.warning(f"Table name '{tb_name}' does not follow naming convention, using fallback")
@@ -347,7 +341,7 @@ class LocalFileStorage(FileStorageBase):
             return pd.DataFrame()
     
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, 
-                        index: List[str], auto_extend_col: bool = False,
+                        index: List[str],
                         format_ext: str = 'parquet') -> None:
         """
         Insert/update DataFrame into file storage
@@ -357,7 +351,6 @@ class LocalFileStorage(FileStorageBase):
             schema: Schema name (used as directory)
             tb_name: Table name (used as filename base)
             index: List of columns to use as primary key for deduplication
-            auto_extend_col: Whether to automatically add new columns (always True for files)
             format_ext: Target file format (default 'parquet'). Must be supported and
                 have its dependencies installed. No silent fallback occurs.
         """
