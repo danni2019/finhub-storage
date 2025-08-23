@@ -126,6 +126,13 @@ class DuckDBFileStorage(LocalFileStorage):
 
         df_prepared = self._prepare_dataframe_for_storage(df.copy())
         format_to_use = format_ext or self.default_format
+
+        if format_to_use != self.default_format:
+            super().insert_dataframe(
+                df, schema, tb_name, index, format_ext
+            )
+            return
+
         self._validate_format(format_to_use, raise_missing_dependency=True)
 
         # Ensure directory and file path
@@ -213,6 +220,12 @@ class DuckDBFileStorage(LocalFileStorage):
                        format_ext: str = 'parquet') -> pd.DataFrame:
         """Read with predicate pushdown & column pruning using DuckDB over Parquet."""
         requested_format = format_ext or self.default_format
+
+        if requested_format != self.default_format:
+            return super().read_dataframe(
+                schema, tb_name, filter_column, filter_keyword, ascending, limit, format_ext
+            )
+
         self._validate_format(requested_format, raise_missing_dependency=True)
 
         existing_format = self._detect_existing_format(schema, tb_name)
@@ -258,3 +271,30 @@ class DuckDBFileStorage(LocalFileStorage):
         # Keep parity with base class post-processing
         df = self._normalize_datetime_columns(df)
         return df.reset_index(drop=True)
+
+    def execute_sql(self, sql: str) -> pd.DataFrame:
+        """Execute a SQL query and return the result as a DataFrame."""
+        try:
+            with self._duckdb_connection() as conn:
+                df = conn.execute(sql).fetchdf()
+                return df
+        except Exception as e:
+            logger.error(f"DuckDB execute failed: {e}")
+            return pd.DataFrame()
+        
+
+if __name__ == "__main__":
+    db = DuckDBFileStorage()
+    x = db.execute_sql(
+        """
+        SELECT
+            regexp_extract(filename, 'stock_md_etf_([A-Z0-9]+)_daily_AKSHARE\\.parquet', 1) AS contract,
+            *
+        FROM read_parquet('C:./projects/finHub/doc/fs/asset/raw/cn/stock_md_etf_*_daily_AKSHARE.parquet')
+        WHERE trading_date = '2025-08-22'
+        AND amount > 10000000;
+        """
+    )
+    x['market_cap'] = (x['amount'] / x['turnover_rate']) * 100
+    x = x[x['market_cap'] > 100000000]
+    print(x)
