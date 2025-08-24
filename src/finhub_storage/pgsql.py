@@ -161,56 +161,77 @@ class PostgreSQL:
                     self.__execute_sql__(f'CREATE INDEX IF NOT EXISTS "{idx}" ON "{schema}"."{tb_name}" ("{d}", "{col}" DESC);')
 
     @staticmethod
-    def __map_table_types__(df: pd.DataFrame):
+    def __map_table_types__(df: pd.DataFrame) -> dict:
         type_dic_for_pg = {}
-        for k, v in df.dtypes.to_dict().items():
-            col_lower = str(k).lower()
-            vt = str(v).lower()
-            if ('date' in col_lower) or ('time' in col_lower):
-                type_dic_for_pg[k] = 'TIMESTAMP'
-            elif vt == 'bool' or vt == 'boolean':
-                type_dic_for_pg[k] = 'BOOLEAN'
-            elif 'int' in vt:
-                type_dic_for_pg[k] = 'BIGINT' if 'int64' in vt else 'INTEGER'
-            elif 'float' in vt:
-                type_dic_for_pg[k] = 'DOUBLE PRECISION'
+
+        for col in df.columns:
+            dtype = df[col].dtype
+
+            # datetime / timestamp
+            if pd.api.types.is_datetime64_any_dtype(dtype):
+                type_dic_for_pg[col] = "TIMESTAMP"
+
+            # integer
+            elif pd.api.types.is_integer_dtype(dtype):
+                # 用 BIGINT 容纳 Int64/大整数
+                type_dic_for_pg[col] = "BIGINT"
+
+            # float
+            elif pd.api.types.is_float_dtype(dtype):
+                type_dic_for_pg[col] = "NUMERIC"
+
+            # boolean
+            elif pd.api.types.is_bool_dtype(dtype):
+                type_dic_for_pg[col] = "BOOLEAN"
+
+            # fallback → TEXT
             else:
-                type_dic_for_pg[k] = 'TEXT'
+                type_dic_for_pg[col] = "TEXT"
+
         return type_dic_for_pg
 
 
     @staticmethod
-    def __alter_df_type_for_sql__(df: pd.DataFrame):
-        for k, v in df.dtypes.to_dict().items():
-            col_lower = str(k).lower()
-            vt = str(v).lower()
+    def __alter_df_type_for_sql__(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
 
-            if ('date' in col_lower) or ('time' in col_lower):
-                s = pd.to_datetime(df[k], errors='coerce')
-                try:
-                    if isinstance(s.dtype, pd.DatetimeTZDtype):
+        for col in df.columns:
+            dtype_str = str(df[col].dtype).lower()
+
+            # datetime / timestamp
+            if 'date' in col.lower() or 'time' in col.lower() or dtype_str.startswith('datetime'):
+                s = pd.to_datetime(df[col], errors='coerce')
+                # 去掉 tz
+                if hasattr(s.dt, "tz_localize"):
+                    try:
                         s = s.dt.tz_localize(None)
-                except Exception:
-                    s = s.apply(lambda x: x.replace(tzinfo=None) if (pd.notna(x) and getattr(x, 'tzinfo', None)) else x)
-                df[k] = s.apply(lambda x: x.to_pydatetime() if pd.notna(x) else None).astype(object)
+                    except Exception:
+                        s = s.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) and getattr(x, "tzinfo", None) else x)
+                # NaT → None
+                df[col] = s.where(pd.notna(s), None)
 
-            elif 'int' in vt:
-                s = pd.to_numeric(df[k], errors='coerce')
-                s = s.astype('Int64')
-                df[k] = s.where(s.notna(), None).astype(object)
+            # integer
+            elif 'int' in dtype_str:
+                s = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+                # NA → None
+                df[col] = s.where(s.notna(), None)
 
-            elif 'float' in vt:
-                s = pd.to_numeric(df[k], errors='coerce')
-                df[k] = s.where(pd.notna(s), None).astype(object)
+            # float
+            elif 'float' in dtype_str:
+                s = pd.to_numeric(df[col], errors='coerce')
+                # NaN → None
+                df[col] = s.where(pd.notna(s), None)
 
-            elif vt == 'bool':
-                s = df[k].astype('boolean')
-                df[k] = s.where(s.notna(), None).astype(object)
+            # boolean
+            elif dtype_str in ('bool', 'boolean'):
+                s = df[col].astype('boolean')
+                df[col] = s.where(s.notna(), None)
 
+            # 其他 → 文本
             else:
-                # 文本列也尽量用 None 表示 NULL，而不是空字符串
-                s = df[k].astype(object)
-                df[k] = s.where(pd.notna(s), None)
+                s = df[col].astype(object)
+                df[col] = s.where(pd.notna(s), None)
+
         return df
 
 
@@ -263,7 +284,7 @@ class PostgreSQL:
             alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ADD COLUMN "{col}" {col_type};'
             self.__execute_sql__(alter_sql)
 
-    def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = False):
+    def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = True):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return
         self.__alter_df_type_for_sql__(df)
