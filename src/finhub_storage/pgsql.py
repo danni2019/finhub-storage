@@ -8,7 +8,7 @@ from infra.tool.config import postgres_config
 from infra.tool.log import log
 
 
-logger = log(__file__, 'database')
+logger = log(__file__, 'infra')
 
 """
 finHub database ORM -- PostgreSQL
@@ -271,7 +271,7 @@ class PostgreSQL:
         records = list(df.itertuples(index=False, name=None))
         with self.transaction():
             with self.__get_cursor__() as cursor:
-                psycopg2.extras.execute_values(cursor, sql, records, page_size=500)
+                psycopg2.extras.execute_values(cursor, sql, records, page_size=5000)
 
     def __ensure_columns_exist__(self, df: pd.DataFrame, schema: str, tb_name: str):
         existing_cols = self.get_col_names(schema, tb_name)
