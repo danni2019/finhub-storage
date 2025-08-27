@@ -3,6 +3,7 @@ import psycopg2.extras
 import pandas as pd
 from datetime import datetime
 from typing import Union
+from decimal import Decimal
 from contextlib import contextmanager
 from infra.tool.config import postgres_config
 from infra.tool.log import log
@@ -364,6 +365,12 @@ class PostgreSQL:
                         df[col] = pd.to_datetime(df[col], errors='coerce')
                     except Exception as e:
                         logger.warning(f"Failed to convert column {col} to datetime: {e}")
+
+                if df[col].apply(lambda x: isinstance(x, Decimal)).any():
+                    try:
+                        df[col] = df[col].astype(float)
+                    except Exception as e:
+                        logger.warning(f"Failed to convert column {col} from Decimal to float: {e}")
         return df
 
 
@@ -381,16 +388,22 @@ class PostgreSQL:
         rows = self.__execute_sql__(sql)
         return [i['tablename'] for i in rows] if rows else []
 
-    def exists(self, schema: str, tb_name: str, filter: dict) -> bool:
+    def exists(self, schema: str, tb_name: str, filter_keyword: dict) -> bool:
         """检查是否存在满足条件的记录"""
-        if not filter:
+        if not filter_keyword:
             return False
         
-        where_clause = ' AND '.join([f'"{k}" = %s' for k in filter.keys()])
-        sql = f"""SELECT 1 FROM "{schema}"."{tb_name}" WHERE {where_clause} LIMIT 1;"""
+        if not self.__check_table__(schema, tb_name, False):
+            return False
+        
+        where_sql, params = self.__make_filters__(filter_keyword)
+
+        sql = f"""SELECT 1 FROM "{schema}"."{tb_name}" WHERE {where_sql} LIMIT 1;"""
         try:
+            self.__ensure_connection__()
+            self.conn.autocommit = True
             with self.__get_cursor__() as cursor:
-                cursor.execute(sql, list(filter.values()))
+                cursor.execute(sql, params)
                 return bool(cursor.fetchone())
         except Exception as e:
             logger.error(f"Exists check failed for {schema}.{tb_name}: {e}")
