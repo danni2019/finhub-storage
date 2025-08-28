@@ -179,7 +179,7 @@ class PostgreSQL:
 
             # float
             elif pd.api.types.is_float_dtype(dtype):
-                type_dic_for_pg[col] = "NUMERIC"
+                type_dic_for_pg[col] = "DOUBLE PRECISION"
 
             # boolean
             elif pd.api.types.is_bool_dtype(dtype):
@@ -193,8 +193,8 @@ class PostgreSQL:
 
 
     @staticmethod
-    def __alter_df_type_for_sql__(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
+    def __alter_df_type_for_sql__(d: pd.DataFrame) -> pd.DataFrame:
+        df = d.copy()
 
         for col in df.columns:
             dtype_str = str(df[col].dtype).lower()
@@ -248,9 +248,9 @@ class PostgreSQL:
                         df: pd.DataFrame = None, index: list = None):
         self.__ensure_schema_exists__(schema)
         try:
-            self.__execute_sql__(f'SELECT 1 FROM "{schema}"."{tb_name}" LIMIT 1;')
-            return True
-        except psycopg2.errors.UndefinedTable:
+            rows = self.__execute_sql__(f"SELECT to_regclass(%s) AS r;", [f'{schema}.{tb_name}'])
+            if rows and rows[0].get('r'):
+                return True
             if create_table_on_error and df is not None and index is not None:
                 self.create_table(df, schema, tb_name, index)
                 return True
@@ -260,35 +260,42 @@ class PostgreSQL:
             return False
 
     def __write_df_into_table__(self, df: pd.DataFrame, schema: str, tb_name: str, index: list):
-        columns = ','.join([f'"{c}"' for c in df.columns.tolist()])
-        # 联合主键字段
+        columns = [f'"{c}"' for c in df.columns.tolist()]
         pk_fields = ', '.join([f'"{col}"' for col in index])
-        # ON CONFLICT 语句用联合主键
+        update_cols = [c for c in df.columns if c not in index]
+        set_sql = ', '.join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
+        # 目标表别名 "t" 用于 WHERE 差异判断
+        diff_where = ' OR '.join([f'"t"."{c}" IS DISTINCT FROM EXCLUDED."{c}"' for c in update_cols]) or 'FALSE'
+
         sql = (
-            f'INSERT INTO "{schema}"."{tb_name}" ({columns}) VALUES %s '
-            f'ON CONFLICT ({pk_fields}) DO UPDATE SET '
-            + ', '.join([f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c not in index])
+            f'INSERT INTO "{schema}"."{tb_name}" ({", ".join(columns)}) VALUES %s '
+            f'ON CONFLICT ({pk_fields}) DO UPDATE SET {set_sql} '
+            f'WHERE {diff_where};'
         )
-        records = list(df.itertuples(index=False, name=None))
+
+        def rows_iter():
+            for row in df.itertuples(index=False, name=None):
+                yield row
+
         with self.transaction():
             with self.__get_cursor__() as cursor:
-                psycopg2.extras.execute_values(cursor, sql, records, page_size=5000)
+                # 根据数据量调节 page_size（常见 2k~10k）
+                psycopg2.extras.execute_values(cursor, sql, rows_iter(), page_size=5000)
 
     def __ensure_columns_exist__(self, df: pd.DataFrame, schema: str, tb_name: str):
-        existing_cols = self.get_col_names(schema, tb_name)
-        missing_cols = [col for col in df.columns.tolist() if col not in existing_cols]
-        if not missing_cols:
+        existing = set(self.get_col_names(schema, tb_name))
+        missing = [c for c in df.columns if c not in existing]
+        if not missing:
             return
-        type_mapping = self.__map_table_types__(df)
-        for col in missing_cols:
-            col_type = type_mapping.get(col, 'TEXT')
-            alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ADD COLUMN "{col}" {col_type};'
-            self.__execute_sql__(alter_sql)
+        tm = self.__map_table_types__(df)
+        parts = [f'ADD COLUMN IF NOT EXISTS "{c}" {tm.get(c, "TEXT")}' for c in missing]
+        alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ' + ', '.join(parts) + ';'
+        self.__execute_sql__(alter_sql)
 
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = True):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return
-        self.__alter_df_type_for_sql__(df)
+        df = self.__alter_df_type_for_sql__(df)
         df = self.__forge_primary_id__(df, index)
         self.__check_table__(schema, tb_name, True, df, index)
         if auto_extend_col:
@@ -400,11 +407,10 @@ class PostgreSQL:
 
         sql = f"""SELECT 1 FROM "{schema}"."{tb_name}" WHERE {where_sql} LIMIT 1;"""
         try:
-            self.__ensure_connection__()
-            self.conn.autocommit = True
-            with self.__get_cursor__() as cursor:
-                cursor.execute(sql, params)
-                return bool(cursor.fetchone())
+            with self.transaction():
+                with self.__get_cursor__() as cursor:
+                    cursor.execute(sql, params)
+                    return bool(cursor.fetchone())
         except Exception as e:
             logger.error(f"Exists check failed for {schema}.{tb_name}: {e}")
             return False
