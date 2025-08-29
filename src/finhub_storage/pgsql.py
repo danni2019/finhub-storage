@@ -1,6 +1,7 @@
 import psycopg2
 import psycopg2.extras
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from typing import Union
 from decimal import Decimal
@@ -106,8 +107,13 @@ class PostgreSQL:
                     logger.error(f"Rollback failed: {re}")
             raise
 
-    def read_by_sql(self, sql_str: str):
+    def read_by_sql(self, sql_str: str, schema_and_tb_list: list[tuple[str, str]] = None):
         """执行SQL查询并返回结果"""
+        if len(schema_and_tb_list) > 0:
+            for schema, tb_name in schema_and_tb_list:
+                if not self.__check_table__(schema, tb_name, False):
+                    logger.warning(f"No table found: {schema}.{tb_name}")
+                    return None
         return self.__execute_sql__(sql_str)
 
     def is_timescaledb_enabled(self):
@@ -248,9 +254,9 @@ class PostgreSQL:
                         df: pd.DataFrame = None, index: list = None):
         self.__ensure_schema_exists__(schema)
         try:
-            rows = self.__execute_sql__(f"SELECT to_regclass(%s) AS r;", [f'{schema}.{tb_name}'])
-            if rows and rows[0].get('r'):
-                return True
+            self.__execute_sql__(f'SELECT 1 FROM "{schema}"."{tb_name}" LIMIT 1;')
+            return True
+        except psycopg2.errors.UndefinedTable:
             if create_table_on_error and df is not None and index is not None:
                 self.create_table(df, schema, tb_name, index)
                 return True
@@ -260,39 +266,57 @@ class PostgreSQL:
             return False
 
     def __write_df_into_table__(self, df: pd.DataFrame, schema: str, tb_name: str, index: list):
-        columns = [f'"{c}"' for c in df.columns.tolist()]
+        # 原始列名与带引号的列片段
+        cols = df.columns.tolist()
+        cols_quoted = ', '.join([f'"{c}"' for c in cols])
+
+        # 主键字段
         pk_fields = ', '.join([f'"{col}"' for col in index])
-        update_cols = [c for c in df.columns if c not in index]
-        set_sql = ', '.join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
-        # 目标表别名 "t" 用于 WHERE 差异判断
-        diff_where = ' OR '.join([f'"t"."{c}" IS DISTINCT FROM EXCLUDED."{c}"' for c in update_cols]) or 'FALSE'
 
-        sql = (
-            f'INSERT INTO "{schema}"."{tb_name}" ({", ".join(columns)}) VALUES %s '
-            f'ON CONFLICT ({pk_fields}) DO UPDATE SET {set_sql} '
-            f'WHERE {diff_where};'
-        )
+        # 需要在 UPDATE 中更新的列（非主键）
+        update_cols = [c for c in cols if c not in index]
 
-        def rows_iter():
-            for row in df.itertuples(index=False, name=None):
-                yield row
+        if not update_cols:
+            # 没有可更新列 -> ON CONFLICT DO NOTHING
+            sql = (
+                f'INSERT INTO "{schema}"."{tb_name}" ({cols_quoted}) VALUES %s '
+                f'ON CONFLICT ({pk_fields}) DO NOTHING;'
+            )
+        else:
+            # 有可更新列 -> 构造 SET 和基于 IS DISTINCT FROM 的 WHERE 来避免无差异更新
+            set_sql = ', '.join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
+            diff_where = ' OR '.join([f't."{c}" IS DISTINCT FROM EXCLUDED."{c}"' for c in update_cols])
+            sql = (
+                f'INSERT INTO "{schema}"."{tb_name}" AS t ({cols_quoted}) VALUES %s '
+                f'ON CONFLICT ({pk_fields}) DO UPDATE SET {set_sql} '
+                f'WHERE {diff_where};'
+            )
 
+        # 执行写入（保持你原来的批量策略）
         with self.transaction():
             with self.__get_cursor__() as cursor:
-                # 根据数据量调节 page_size（常见 2k~10k）
-                psycopg2.extras.execute_values(cursor, sql, rows_iter(), page_size=5000)
+
+                def _row_tuple(row):
+                    return tuple(
+                        None if (isinstance(x, (pd._libs.tslibs.nattype.NaTType, np.datetime64)) and pd.isna(x))
+                        else (x.item() if isinstance(x, np.generic) else x)
+                        for x in row
+                    )
+                rows = (_row_tuple(x) for x in df.itertuples(index=False, name=None))
+                psycopg2.extras.execute_values(cursor, sql, rows, page_size=5000)
 
     def __ensure_columns_exist__(self, df: pd.DataFrame, schema: str, tb_name: str):
-        existing = set(self.get_col_names(schema, tb_name))
-        missing = [c for c in df.columns if c not in existing]
-        if not missing:
+        existing_cols = self.get_col_names(schema, tb_name)
+        missing_cols = [col for col in df.columns.tolist() if col not in existing_cols]
+        if not missing_cols:
             return
-        tm = self.__map_table_types__(df)
-        parts = [f'ADD COLUMN IF NOT EXISTS "{c}" {tm.get(c, "TEXT")}' for c in missing]
-        alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ' + ', '.join(parts) + ';'
-        self.__execute_sql__(alter_sql)
+        type_mapping = self.__map_table_types__(df)
+        for col in missing_cols:
+            col_type = type_mapping.get(col, 'TEXT')
+            alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ADD COLUMN "{col}" {col_type};'
+            self.__execute_sql__(alter_sql)
 
-    def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = True):
+    def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = False):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return
         df = self.__alter_df_type_for_sql__(df)
