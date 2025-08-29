@@ -109,7 +109,7 @@ class PostgreSQL:
 
     def read_by_sql(self, sql_str: str, schema_and_tb_list: list[tuple[str, str]] = None):
         """执行SQL查询并返回结果"""
-        if len(schema_and_tb_list) > 0:
+        if isinstance(schema_and_tb_list, list) and len(schema_and_tb_list) > 0:
             for schema, tb_name in schema_and_tb_list:
                 if not self.__check_table__(schema, tb_name, False):
                     logger.warning(f"No table found: {schema}.{tb_name}")
