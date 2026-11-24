@@ -1,12 +1,30 @@
 # finHub Storage
 
-DataFrame storage extracted from finHub. The package supports local Parquet files, a DuckDB-backed Parquet path, and a PostgreSQL adapter. Configuration is supplied by the caller.
+Store and retrieve pandas DataFrames using local Parquet files, DuckDB over Parquet, or PostgreSQL. Supply the storage path or connection mapping from your application.
+
+## Try a Parquet round trip
+
+From a checkout with Python 3.11 or newer:
 
 ```sh
 python -m pip install .
 python examples/demo.py
 ```
 
-The demo uses synthetic prices and a temporary directory. Install `.[duckdb]` or `.[postgres]` for the optional backends. Construct `DuckDBFileStorage` with a storage directory and `PostgreSQL` with a connection mapping. Each backend exposes `insert_dataframe` and `read_dataframe`. Raw SQL helpers take developer-controlled SQL.
+The [demo](examples/demo.py) writes three synthetic prices to a temporary directory and reads rows where `id >= 2`. It prints:
 
-The release preserves the 2025 history for the extracted storage files. The packaging commit separates local configuration and licensing from the original application.
+```text
+ id  price
+  2  102.5
+  3  103.0
+```
+
+| Backend | Use it for | Installation |
+| --- | --- | --- |
+| `LocalFileStorage` | Local Parquet reads and writes | `python -m pip install .` |
+| `DuckDBFileStorage` | DuckDB-backed filtering and upserts on local files | `python -m pip install '.[duckdb]'` |
+| `PostgreSQL` | DataFrame reads and writes against a PostgreSQL server you configure | `python -m pip install '.[postgres]'` |
+
+Each backend exposes `insert_dataframe` and `read_dataframe`. Raw SQL helpers take developer-controlled SQL.
+
+This [MIT-licensed extraction](LICENSE) preserves the related 2025 storage history.
