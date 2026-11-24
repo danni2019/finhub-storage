@@ -1,3 +1,4 @@
+import logging
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -6,11 +7,13 @@ from datetime import datetime
 from typing import Union
 from decimal import Decimal
 from contextlib import contextmanager
-from infra.tool.config import postgres_config
-from infra.tool.log import log
 
 
-logger = log(__file__, 'infra')
+logger = logging.getLogger(__name__)
+
+
+def _ident(value):
+    return '"' + str(value).replace('"', '""') + '"'
 
 """
 finHub database ORM -- PostgreSQL
@@ -21,22 +24,26 @@ Datetime列规范：
 """
 
 class PostgreSQL:
-    def __init__(self, timeout: int = 15):
+    def __init__(self, config: dict, timeout: int = 15):
         """
         Initialize PostgreSQL connection manager.
         Args:
             timeout: Connection timeout in seconds
         """
-        self.config = postgres_config()
+        self.config = dict(config)
         # 配置中应提供 database（数据库名）；若缺失则默认使用 postgres
 
         self.timeout = timeout
         self.conn = None
         self.__connect__()
 
+    def close(self):
+        if self.conn and not self.conn.closed:
+            self.conn.close()
+
     @staticmethod
     def __clear_config__(conf: dict):
-        allowed_keys = {'host', 'port', 'user', 'password', 'database', 'dbname', 'sslmode', 'connect_timeout'}
+        allowed_keys = {'host', 'port', 'user', 'password', 'database', 'dbname', 'sslmode'}
         clean_cfg = {k: v for k, v in conf.items() if k in allowed_keys}
         # 兼容：优先使用 'database'，转为 psycopg2 接受的 'dbname'
         if 'database' in clean_cfg:
@@ -77,7 +84,7 @@ class PostgreSQL:
         self.__ensure_connection__()
         with self.transaction():
             with self.__get_cursor__() as cursor:
-                cursor.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
+                cursor.execute(f'CREATE SCHEMA IF NOT EXISTS {_ident(schema)};')
 
     @contextmanager
     def __get_cursor__(self):
@@ -128,7 +135,7 @@ class PostgreSQL:
         if not time_col:
             return
         # '"schema"."table"' 作为 text 再转 regclass，time_col 也加双引号
-        rel = f'"{schema}"."{tb_name}"'
+        rel = f'{_ident(schema)}.{_ident(tb_name)}'
         sql = "SELECT create_hypertable(%s::regclass, %s, if_not_exists => TRUE);"
         try:
             self.__execute_sql__(sql, params=[rel, time_col])
@@ -144,10 +151,10 @@ class PostgreSQL:
                 raise ValueError(f"Primary key column '{col}' is missing in DataFrame.")
         self.__ensure_schema_exists__(schema)
         datatype_dic = self.__map_table_types__(df)
-        columns = [f'"{k}" {v}' for k, v in datatype_dic.items()]
-        pk_fields = ', '.join([f'"{col}"' for col in index])
+        columns = [f'{_ident(k)} {v}' for k, v in datatype_dic.items()]
+        pk_fields = ', '.join([f'{_ident(col)}' for col in index])
         columns_str = ", ".join(columns + [f'PRIMARY KEY ({pk_fields})'])
-        create_table_sql = f'CREATE TABLE IF NOT EXISTS "{schema}"."{tb_name}" ({columns_str});'
+        create_table_sql = f'CREATE TABLE IF NOT EXISTS {_ident(schema)}.{_ident(tb_name)} ({columns_str});'
         self.__execute_sql__(create_table_sql)
         """
         此处会自动检测index并为时序数据创建hypertable。
@@ -161,11 +168,12 @@ class PostgreSQL:
 
     def create_time_indexes(self, schema, tb_name, time_cols, dim_cols: list[str] | None = None):
         for col in time_cols:
-            self.__execute_sql__(f'CREATE INDEX IF NOT EXISTS "{tb_name}_{col}_idx" ON "{schema}"."{tb_name}" ("{col}");')
+            idx_name = _ident(f'{tb_name}_{col}_idx')
+            self.__execute_sql__(f'CREATE INDEX IF NOT EXISTS {idx_name} ON {_ident(schema)}.{_ident(tb_name)} ({_ident(col)});')
             if dim_cols:
                 for d in dim_cols:
                     idx = f'{tb_name}_{d}_{col}_idx'
-                    self.__execute_sql__(f'CREATE INDEX IF NOT EXISTS "{idx}" ON "{schema}"."{tb_name}" ("{d}", "{col}" DESC);')
+                    self.__execute_sql__(f'CREATE INDEX IF NOT EXISTS {_ident(idx)} ON {_ident(schema)}.{_ident(tb_name)} ({_ident(d)}, {_ident(col)} DESC);')
 
     @staticmethod
     def __map_table_types__(df: pd.DataFrame) -> dict:
@@ -254,7 +262,7 @@ class PostgreSQL:
                         df: pd.DataFrame = None, index: list = None):
         self.__ensure_schema_exists__(schema)
         try:
-            self.__execute_sql__(f'SELECT 1 FROM "{schema}"."{tb_name}" LIMIT 1;')
+            self.__execute_sql__(f'SELECT 1 FROM {_ident(schema)}.{_ident(tb_name)} LIMIT 1;')
             return True
         except psycopg2.errors.UndefinedTable:
             if create_table_on_error and df is not None and index is not None:
@@ -268,10 +276,10 @@ class PostgreSQL:
     def __write_df_into_table__(self, df: pd.DataFrame, schema: str, tb_name: str, index: list):
         # 原始列名与带引号的列片段
         cols = df.columns.tolist()
-        cols_quoted = ', '.join([f'"{c}"' for c in cols])
+        cols_quoted = ', '.join([f'{_ident(c)}' for c in cols])
 
         # 主键字段
-        pk_fields = ', '.join([f'"{col}"' for col in index])
+        pk_fields = ', '.join([f'{_ident(col)}' for col in index])
 
         # 需要在 UPDATE 中更新的列（非主键）
         update_cols = [c for c in cols if c not in index]
@@ -279,15 +287,15 @@ class PostgreSQL:
         if not update_cols:
             # 没有可更新列 -> ON CONFLICT DO NOTHING
             sql = (
-                f'INSERT INTO "{schema}"."{tb_name}" ({cols_quoted}) VALUES %s '
+                f'INSERT INTO {_ident(schema)}.{_ident(tb_name)} ({cols_quoted}) VALUES %s '
                 f'ON CONFLICT ({pk_fields}) DO NOTHING;'
             )
         else:
             # 有可更新列 -> 构造 SET 和基于 IS DISTINCT FROM 的 WHERE 来避免无差异更新
-            set_sql = ', '.join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
-            diff_where = ' OR '.join([f't."{c}" IS DISTINCT FROM EXCLUDED."{c}"' for c in update_cols])
+            set_sql = ', '.join([f'{_ident(c)} = EXCLUDED.{_ident(c)}' for c in update_cols])
+            diff_where = ' OR '.join([f't.{_ident(c)} IS DISTINCT FROM EXCLUDED.{_ident(c)}' for c in update_cols])
             sql = (
-                f'INSERT INTO "{schema}"."{tb_name}" AS t ({cols_quoted}) VALUES %s '
+                f'INSERT INTO {_ident(schema)}.{_ident(tb_name)} AS t ({cols_quoted}) VALUES %s '
                 f'ON CONFLICT ({pk_fields}) DO UPDATE SET {set_sql} '
                 f'WHERE {diff_where};'
             )
@@ -313,7 +321,7 @@ class PostgreSQL:
         type_mapping = self.__map_table_types__(df)
         for col in missing_cols:
             col_type = type_mapping.get(col, 'TEXT')
-            alter_sql = f'ALTER TABLE "{schema}"."{tb_name}" ADD COLUMN "{col}" {col_type};'
+            alter_sql = f'ALTER TABLE {_ident(schema)}.{_ident(tb_name)} ADD COLUMN {_ident(col)} {col_type};'
             self.__execute_sql__(alter_sql)
 
     def insert_dataframe(self, df: pd.DataFrame, schema: str, tb_name: str, index: list, auto_extend_col: bool = False):
@@ -332,11 +340,11 @@ class PostgreSQL:
             f"""
             SELECT column_name 
             FROM information_schema.columns 
-            WHERE table_schema = '{schema}' AND table_name = '{tb_name}'
+            WHERE table_schema = %s AND table_name = %s
             ORDER BY ordinal_position;
             """
         )
-        rows = self.__execute_sql__(sql)
+        rows = self.__execute_sql__(sql, (schema, tb_name))
         return [r['column_name'] for r in rows] if rows else []
 
     def __operand_map_for_sql__(self, input_) -> str:
@@ -357,11 +365,11 @@ class PostgreSQL:
                         clauses.append("1=0")
                         continue
                     placeholders = ", ".join(["%s"] * len(val))
-                    clauses.append(f'"{k}" IN ({placeholders})')
+                    clauses.append(f'{_ident(k)} IN ({placeholders})')
                     params.extend(val)
                 else:
                     sqlop = self.__operand_map_for_sql__(op)
-                    clauses.append(f'"{k}" {sqlop} %s')
+                    clauses.append(f'{_ident(k)} {sqlop} %s')
                     params.append(val)
         return " AND ".join(clauses), params
 
@@ -373,14 +381,14 @@ class PostgreSQL:
             logger.warning(f"No table found: {schema}.{tb_name}")
             return pd.DataFrame()
 
-        col_param = ', '.join([f'"{i}"' for i in filter_column]) if filter_column else "*"
+        col_param = ', '.join([f'{_ident(i)}' for i in filter_column]) if filter_column else "*"
         where_sql, params = self.__make_filters__(filter_keyword)
 
-        sql = f'SELECT {col_param} FROM "{schema}"."{tb_name}"'
+        sql = f'SELECT {col_param} FROM {_ident(schema)}.{_ident(tb_name)}'
         if where_sql:
             sql += f" WHERE {where_sql}"
         if ascending:
-            order_sql = ', '.join([f'"{c}" {"ASC" if a else "DESC"}' for c, a in ascending])
+            order_sql = ', '.join([f'{_ident(c)} {"ASC" if a else "DESC"}' for c, a in ascending])
             sql += f' ORDER BY {order_sql}'
         if limit:
             sql += f' LIMIT {limit}'
@@ -406,17 +414,17 @@ class PostgreSQL:
 
 
     def del_row(self, schema: str, tb_name: str, filter_sql: str):
-        sql = f'DELETE FROM "{schema}"."{tb_name}" WHERE {filter_sql};'
+        sql = f'DELETE FROM {_ident(schema)}.{_ident(tb_name)} WHERE {filter_sql};'
         self.__execute_sql__(sql)
 
     def drop_table(self, schema: str, tb_name: str):
-        sql = f'DROP TABLE IF EXISTS "{schema}"."{tb_name}";'
+        sql = f'DROP TABLE IF EXISTS {_ident(schema)}.{_ident(tb_name)};'
         self.__execute_sql__(sql)
 
     def get_table_name(self, schema: str):
         """获取指定 schema 下的所有表名"""
-        sql = f"SELECT tablename FROM pg_tables WHERE schemaname='{schema}' ORDER BY tablename;"
-        rows = self.__execute_sql__(sql)
+        sql = "SELECT tablename FROM pg_tables WHERE schemaname=%s ORDER BY tablename;"
+        rows = self.__execute_sql__(sql, (schema,))
         return [i['tablename'] for i in rows] if rows else []
 
     def exists(self, schema: str, tb_name: str, filter_keyword: dict) -> bool:
@@ -429,7 +437,7 @@ class PostgreSQL:
         
         where_sql, params = self.__make_filters__(filter_keyword)
 
-        sql = f"""SELECT 1 FROM "{schema}"."{tb_name}" WHERE {where_sql} LIMIT 1;"""
+        sql = f"""SELECT 1 FROM {_ident(schema)}.{_ident(tb_name)} WHERE {where_sql} LIMIT 1;"""
         try:
             with self.transaction():
                 with self.__get_cursor__() as cursor:
@@ -451,8 +459,8 @@ class PostgreSQL:
         agg_func = self._safe_agg(agg_func)
         where_sql, params = self.__make_filters__(filter_keyword)
         sql = (
-            f'SELECT time_bucket(%s::interval, "{time_col}") AS bucket, {agg_func}("{agg_col}") AS value '
-            f'FROM "{schema}"."{tb_name}"'
+            f'SELECT time_bucket(%s::interval, {_ident(time_col)}) AS bucket, {agg_func}({_ident(agg_col)}) AS value '
+            f'FROM {_ident(schema)}.{_ident(tb_name)}'
         )
         if where_sql:
             sql += f' WHERE {where_sql}'
@@ -466,8 +474,8 @@ class PostgreSQL:
         agg_func = self._safe_agg(agg_func)
         where_sql, params = self.__make_filters__(filter_keyword)
         sql = (
-            f'SELECT time_bucket_gapfill(%s::interval, "{time_col}") AS bucket, {agg_func}("{agg_col}") AS value '
-            f'FROM "{schema}"."{tb_name}"'
+            f'SELECT time_bucket_gapfill(%s::interval, {_ident(time_col)}) AS bucket, {agg_func}({_ident(agg_col)}) AS value '
+            f'FROM {_ident(schema)}.{_ident(tb_name)}'
         )
         if where_sql:
             sql += f' WHERE {where_sql}'
@@ -477,7 +485,7 @@ class PostgreSQL:
     
     def enable_compression(self, schema, tb_name):
         try:
-            self.__execute_sql__(f'ALTER TABLE "{schema}"."{tb_name}" SET (timescaledb.compress);')
+            self.__execute_sql__(f'ALTER TABLE {_ident(schema)}.{_ident(tb_name)} SET (timescaledb.compress);')
         except Exception as e:
             logger.warning(f"Enable compression failed: {e}")
 
@@ -487,7 +495,7 @@ class PostgreSQL:
             return
         self.enable_compression(schema, tb_name)
         sql = "SELECT add_compression_policy(%s::regclass, %s::interval);"
-        rel = f'"{schema}"."{tb_name}"'
+        rel = f'{_ident(schema)}.{_ident(tb_name)}'
         try:
             self.__execute_sql__(sql, params=[rel, compress_after])
         except Exception as e:
@@ -498,7 +506,7 @@ class PostgreSQL:
             logger.warning("TimescaleDB not enabled: skip retention policy.")
             return
         sql = "SELECT add_retention_policy(%s::regclass, %s::interval);"
-        rel = f'"{schema}"."{tb_name}"'
+        rel = f'{_ident(schema)}.{_ident(tb_name)}'
         try:
             self.__execute_sql__(sql, params=[rel, drop_after])
         except Exception as e:

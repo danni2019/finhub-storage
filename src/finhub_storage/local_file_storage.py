@@ -1,10 +1,11 @@
 import os
 import json
+import logging
 import pandas as pd
 from pathlib import Path
 from typing import Union, Optional, List, Dict, Any
 from datetime import datetime
-from infra.data.file_storage_base import FileStorageBase
+from .file_storage_base import FileStorageBase
 
 """
 MUST READ!
@@ -34,25 +35,7 @@ then try to read the dataframe from this path.
 """
 
 
-# Try to use the project's logging system, fall back to simple logger
-try:
-    from infra.tool.log import log
-    logger = log(__file__, 'infra')
-except (ImportError, FileNotFoundError):
-    # Simple logger fallback for when config system is not available
-    class SimpleLogger:
-        def info(self, msg): print(f"INFO: {msg}")
-        def warning(self, msg): print(f"WARNING: {msg}")
-        def error(self, msg): print(f"ERROR: {msg}")
-    logger = SimpleLogger()
-
-# Try to import configuration system
-try:
-    from infra.tool.config import file_storage_config
-    CONFIG_AVAILABLE = True
-except (ImportError, FileNotFoundError):
-    CONFIG_AVAILABLE = False
-    logger.warning("Configuration system not available, using default file storage settings")
+logger = logging.getLogger(__name__)
 
 
 class LocalFileStorage(FileStorageBase):
@@ -93,38 +76,14 @@ class LocalFileStorage(FileStorageBase):
         
         Args:
             storage_config: Configuration dictionary containing:
-                - base_path: Base directory for storage (default: from config system or ./doc/fs)
-                - default_format: Default file format (default: from config system or parquet)
-                - create_dirs: Whether to create directories automatically (default: from config system or True)
-                
-        Note: If storage_config is provided, it takes precedence over the config system.
-              This maintains backward compatibility while enabling config system integration.
+                - base_path: Base directory for storage (default: ./data)
+                - default_format: Default file format (default: parquet)
+                - create_dirs: Whether to create directories automatically (default: True)
+
         """
-        # Load configuration from config system if available and no explicit config provided
-        if storage_config is None and CONFIG_AVAILABLE:
-            try:
-                storage_config = file_storage_config()
-                logger.info("File storage configuration loaded from config system")
-            except Exception as e:
-                logger.warning(f"Failed to load config from system: {e}, using defaults")
-                storage_config = {}
-        
-        # Use provided config or default fallback
-        self.config = storage_config or {}
-        base_path_config = self.config.get('base_path', './doc/fs')
-        
-        # 确保使用绝对路径
-        if Path(base_path_config).is_absolute():
-            self.base_path = Path(base_path_config)
-        else:
-            # 对于相对路径，基于项目根目录进行解析
-            try:
-                from infra.tool.config import project_path
-                self.base_path = (Path(project_path()) / base_path_config).resolve()
-            except (ImportError, Exception):
-                # 如果无法获取项目路径，使用当前工作目录
-                self.base_path = Path(base_path_config).resolve()
-        
+        self.config = dict(storage_config or {})
+        self.base_path = Path(self.config.get('base_path', './data')).expanduser().resolve()
+
         self.default_format = self.config.get('default_format', self.DEFAULT_FORMAT)
         self.create_dirs = self.config.get('create_dirs', True)
         
@@ -170,6 +129,12 @@ class LocalFileStorage(FileStorageBase):
                 return False
         return True
     
+    @staticmethod
+    def _safe_component(value):
+        if not value or value in {".", ".."} or "/" in value or chr(92) in value or chr(0) in value:
+            raise ValueError("schema and table names must be single path components")
+        return value
+
     def _parse_table_name(self, tb_name: str) -> tuple:
         """
         Parse table name to extract status and country according to naming convention
@@ -185,11 +150,14 @@ class LocalFileStorage(FileStorageBase):
             Tuple of (status, country, remaining_name)
             If parsing fails, returns (None, None, tb_name)
         """
-        parts = tb_name.split('_')
+        parts = self._safe_component(tb_name).split('_')
         if len(parts) >= 3:
             status = parts[0]
             country = parts[1]
             remaining_name = '_'.join(parts[2:])
+            for item in (status, country):
+                if item:
+                    self._safe_component(item)
             return status, country, remaining_name
         
         # Fallback for non-conforming table names
@@ -218,11 +186,11 @@ class LocalFileStorage(FileStorageBase):
         
         if status and country:
             # Use hierarchical structure: base_path/schema/status/country/remaining_name.format
-            dir_path = self.base_path / schema / status / country
+            dir_path = self.base_path / self._safe_component(schema) / status / country
             file_path = dir_path / f"{remaining_name}.{format_ext}"
         else:
             # Fallback to original structure for non-conforming names
-            schema_path = self.base_path / schema
+            schema_path = self.base_path / self._safe_component(schema)
             file_path = schema_path / f"{tb_name}.{format_ext}"
         
         return file_path
@@ -242,13 +210,13 @@ class LocalFileStorage(FileStorageBase):
             status, country, _ = self._parse_table_name(tb_name)
             if status and country:
                 # Create hierarchical directories: base_path/schema/status/country/
-                dir_path = self.base_path / schema / status / country
+                dir_path = self.base_path / self._safe_component(schema) / status / country
             else:
                 # Fallback to schema directory for non-conforming names
-                dir_path = self.base_path / schema
+                dir_path = self.base_path / self._safe_component(schema)
         else:
             # Traditional schema directory when no table name provided
-            dir_path = self.base_path / schema
+            dir_path = self.base_path / self._safe_component(schema)
         
         if self.create_dirs:
             dir_path.mkdir(parents=True, exist_ok=True)
@@ -615,7 +583,7 @@ class LocalFileStorage(FileStorageBase):
         table_names = set()
         
         # Search hierarchical structure: base_path/schema/status/country/
-        schema_path = self.base_path / schema
+        schema_path = self.base_path / self._safe_component(schema)
         if schema_path.exists() and schema_path.is_dir():
             for status_path in schema_path.iterdir():
                 if status_path.is_dir() and status_path.name in ['raw', 'processed']:
@@ -792,11 +760,11 @@ class LocalFileStorage(FileStorageBase):
         
         if status and country:
             # Use hierarchical structure: base_path/schema/status/country/remaining_name.extension
-            dir_path = self.base_path / schema / status / country
+            dir_path = self.base_path / self._safe_component(schema) / status / country
             file_path = dir_path / f"{remaining_name}{extension}"
         else:
             # Fallback to original structure for non-conforming names
-            schema_path = self.base_path / schema
+            schema_path = self.base_path / self._safe_component(schema)
             file_path = schema_path / tb_name
         
         return file_path

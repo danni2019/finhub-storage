@@ -1,14 +1,13 @@
 import duckdb
 import os
+import logging
 import pandas as pd
 from pathlib import Path
 from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
-from infra.data.local_file_storage import LocalFileStorage
-from infra.tool.log import log
-from infra.tool.config import file_storage_config, project_path
+from .local_file_storage import LocalFileStorage
 
-logger = log(__file__, "infra")
+logger = logging.getLogger(__name__)
 
 # NOTE:
 # This class is designed to be dropped alongside your existing LocalFileStorage.
@@ -37,12 +36,9 @@ class DuckDBFileStorage(LocalFileStorage):
 
     def __init__(self, storage_config: dict = None):
         super().__init__(storage_config)
-        # DuckDB connection (can be ":memory:" or a file path like "./doc/fs/meta.duckdb")
-        self.storage_config = storage_config or file_storage_config()
-
-        self.duckdb_path = Path(project_path()) / Path(self.storage_config.get('base_path')) / Path(self.storage_config.get('duckdb'))
-
-        self.default_format = self.storage_config.get('default_format', 'parquet')
+        self.duckdb_path = self.config.get('duckdb', ':memory:')
+        if self.duckdb_path != ':memory:':
+            self.duckdb_path = str(self.base_path / Path(self.duckdb_path))
 
     @staticmethod
     def _escape_string_literal(path: str) -> str:
@@ -55,7 +51,7 @@ class DuckDBFileStorage(LocalFileStorage):
     @contextmanager
     def _duckdb_connection(self):
         """Context manager for DuckDB connection."""
-        conn = duckdb.connect(self.duckdb_path.as_posix())
+        conn = duckdb.connect(self.duckdb_path)
         try:
             yield conn
         except Exception as e:
